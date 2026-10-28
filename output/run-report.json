@@ -1,0 +1,15 @@
+{
+  "start_time": "2026-10-28T08:53:33.687016+00:00",
+  "duration_seconds": 0.86,
+  "pages_fetched": 0,
+  "cache_hits": 63,
+  "valid_records": 60,
+  "invalid_records": 0,
+  "failed_pages": 1,
+  "failures": [
+    {
+      "url": "https://example.invalid/fake-book.html",
+      "reason": "HTTPSConnectionPool(host='example.invalid', port=443): Max retries exceeded with url: /fake-book.html (Caused by NameResolutionError(\"HTTPSConnection(host='example.invalid', port=443): Failed to resolve 'example.invalid' ([Errno 11001] getaddrinfo failed)\"))"
+    }
+  ]
+}
