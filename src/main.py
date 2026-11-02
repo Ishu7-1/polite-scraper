@@ -1,7 +1,8 @@
 
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import time
 
@@ -19,11 +20,17 @@ REPORT_FILE = OUTPUT_DIR / "run-report.json"
 
 START_URL = "https://books.toscrape.com/"
 HEADERS = {
-    "User-Agent": "PoliteScraper/1.0 (educational project)"
+    "User-Agent": (
+        "PoliteScraper/1.0 "
+        "(educational project; "
+        "https://github.com/Ishu7-1/polite-scraper)"
+    )
 }
 
 MAX_PAGES = 3
 REQUEST_DELAY = 0.5
+REQUEST_TIMEOUT = 10
+MAX_ATTEMPTS = 2
 
 stats = {
     "pages_fetched": 0,
@@ -36,17 +43,32 @@ def now_utc():
     return datetime.now(timezone.utc).isoformat()
 
 
+def record_failure(url, reason):
+    stats["failed_urls"].append({
+        "url": url,
+        "reason": str(reason),
+    })
+
+
 def fetch_with_retry(url):
-    """Retry a timeout or HTTP 5xx error once."""
-    for attempt in range(2):
+    """Fetch a page, retrying a timeout or HTTP 5xx once."""
+    last_request_time = getattr(fetch_with_retry, "last_request_time", 0)
+
+    for attempt in range(MAX_ATTEMPTS):
+        elapsed = time.monotonic() - last_request_time
+
+        if last_request_time and elapsed < REQUEST_DELAY:
+            time.sleep(REQUEST_DELAY - elapsed)
+
         try:
             response = requests.get(
                 url,
                 headers=HEADERS,
-                timeout=10,
+                timeout=REQUEST_TIMEOUT,
             )
+            fetch_with_retry.last_request_time = time.monotonic()
+            last_request_time = fetch_with_retry.last_request_time
 
-            # Retry server errors once, but not 403 or 404.
             if 500 <= response.status_code <= 599:
                 if attempt == 0:
                     print("Server error; retrying once:", url)
@@ -54,10 +76,18 @@ def fetch_with_retry(url):
                     continue
 
             response.raise_for_status()
+
+            # Use the response's declared encoding, or detect one if missing.
+            if not response.encoding or response.encoding.lower() == "iso-8859-1":
+                response.encoding = response.apparent_encoding
+
             stats["pages_fetched"] += 1
             return response.text
 
         except requests.Timeout:
+            fetch_with_retry.last_request_time = time.monotonic()
+            last_request_time = fetch_with_retry.last_request_time
+
             if attempt == 0:
                 print("Timeout; retrying once:", url)
                 time.sleep(1)
@@ -65,46 +95,41 @@ def fetch_with_retry(url):
             raise
 
     raise requests.RequestException(
-        f"Request failed after retry: {url}"
+        f"Request failed after {MAX_ATTEMPTS} attempts: {url}"
     )
 
 
 def get_cached_page(url, cache_file):
-    """Read cached HTML or fetch and cache it."""
-    global_last_request = getattr(get_cached_page, "last_request", 0)
-
+    """Read cached HTML or fetch it and save it locally."""
     if cache_file.exists():
         stats["cache_hits"] += 1
         return cache_file.read_text(encoding="utf-8"), False
 
-    # Keep at least 500 ms between real requests.
-    elapsed = time.monotonic() - global_last_request
-    if global_last_request and elapsed < REQUEST_DELAY:
-        time.sleep(REQUEST_DELAY - elapsed)
-
     try:
         html = fetch_with_retry(url)
+
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(html, encoding="utf-8")
-        get_cached_page.last_request = time.monotonic()
+
         return html, True
+
     except requests.RequestException as error:
-        stats["failed_urls"].append({
-            "url": url,
-            "reason": str(error),
-        })
+        record_failure(url, error)
         print("Failed page; skipping:", url, error)
         return None, False
 
 
 def extract_book_links(html, page_url):
+    """Extract unique absolute book URLs from a catalogue page."""
     soup = BeautifulSoup(html, "html.parser")
     links = []
 
     for book in soup.select("article.product_pod"):
         link = book.select_one("h3 a")
+
         if link and link.get("href"):
-            links.append(urljoin(page_url, link["href"]))
+            absolute_url = urljoin(page_url, link["href"])
+            links.append(absolute_url)
 
     return list(dict.fromkeys(links))
 
@@ -120,8 +145,9 @@ def get_next_page_url(html, current_url):
 
 
 def discover_books():
+    """Discover books on the first three catalogue pages."""
     current_url = START_URL
-    all_links = []
+    book_sources = {}
 
     for page_number in range(1, MAX_PAGES + 1):
         if not current_url:
@@ -131,21 +157,25 @@ def discover_books():
         html, _ = get_cached_page(current_url, cache_file)
 
         if html is None:
+            # Do not pretend later pages were successfully processed.
+            print(f"Catalogue page {page_number} failed.")
             current_url = None
             continue
 
         links = extract_book_links(html, current_url)
-        all_links.extend(links)
-        print(f"Catalogue page {page_number}: {len(links)} books")
 
+        for url in links:
+            book_sources.setdefault(url, page_number)
+
+        print(f"Catalogue page {page_number}: {len(links)} books")
         current_url = get_next_page_url(html, current_url)
 
-    unique_links = list(dict.fromkeys(all_links))
-    print("Unique book URLs:", len(unique_links))
-    return unique_links
+    print("Unique book URLs:", len(book_sources))
+    return book_sources
 
 
 def extract_book_details(html, product_url, source_page):
+    """Extract the required raw fields from a book detail page."""
     soup = BeautifulSoup(html, "html.parser")
 
     title = soup.select_one("div.product_main h1")
@@ -158,7 +188,8 @@ def extract_book_details(html, product_url, source_page):
     if rating:
         rating_text = next(
             (
-                item for item in rating.get("class", [])
+                item
+                for item in rating.get("class", [])
                 if item in {"One", "Two", "Three", "Four", "Five"}
             ),
             None,
@@ -181,25 +212,43 @@ def extract_book_details(html, product_url, source_page):
     }
 
 
-def scrape_books(book_urls):
+def cache_key_for_url(url):
+    """Create a stable cache key from the complete product URL."""
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def scrape_books(book_sources):
+    """Scrape each unique URL using URL-based cache filenames."""
     records = []
 
-    for index, url in enumerate(book_urls, start=1):
-        cache_file = DETAIL_CACHE_DIR / f"book-{index}.html"
-        record_file = DETAIL_CACHE_DIR / f"book-{index}.json"
+    for url, source_page in book_sources.items():
+        cache_key = cache_key_for_url(url)
+        cache_file = DETAIL_CACHE_DIR / f"{cache_key}.html"
+        record_file = DETAIL_CACHE_DIR / f"{cache_key}.json"
 
         html, fetched_now = get_cached_page(url, cache_file)
+
         if html is None:
             continue
 
         try:
             if not fetched_now and record_file.exists():
-                # Preserve the original fetch timestamp on cache hits.
                 record = json.loads(
                     record_file.read_text(encoding="utf-8")
                 )
+
+                # Never reuse a record for a different product URL.
+                if record.get("product_url") != url:
+                    record = extract_book_details(
+                        html, url, source_page
+                    )
+                    record_file.write_text(
+                        json.dumps(
+                            record, indent=2, ensure_ascii=False
+                        ),
+                        encoding="utf-8",
+                    )
             else:
-                source_page = ((index - 1) // 20) + 1
                 record = extract_book_details(
                     html, url, source_page
                 )
@@ -210,17 +259,18 @@ def scrape_books(book_urls):
 
             records.append(record)
 
-        except (ValueError, json.JSONDecodeError) as error:
-            stats["failed_urls"].append({
-                "url": url,
-                "reason": f"Could not process cached record: {error}",
-            })
+        except (ValueError, OSError) as error:
+            record_failure(
+                url,
+                f"Could not process cached record: {error}",
+            )
             print("Failed to process:", url, error)
 
     return records
 
 
 def write_report(start_time, started_at):
+    """Write current scraping statistics and any existing validation counts."""
     elapsed = time.monotonic() - start_time
 
     report = {
@@ -234,26 +284,7 @@ def write_report(start_time, started_at):
         "failures": stats["failed_urls"],
     }
 
-    # Read validation counts if clean_validate.py has already run.
-    clean_file = OUTPUT_DIR / "books.json"
-    error_file = OUTPUT_DIR / "errors.json"
-
-    if clean_file.exists():
-        try:
-            report["valid_records"] = len(
-                json.loads(clean_file.read_text(encoding="utf-8"))
-            )
-        except (ValueError, OSError):
-            pass
-
-    if error_file.exists():
-        try:
-            report["invalid_records"] = len(
-                json.loads(error_file.read_text(encoding="utf-8"))
-            )
-        except (ValueError, OSError):
-            pass
-
+    # Counts are populated by clean_validate.py after validation.
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_FILE.write_text(
         json.dumps(report, indent=2, ensure_ascii=False),
@@ -267,25 +298,28 @@ def write_report(start_time, started_at):
 
 
 def main():
+    # Reset statistics so repeated calls in one process start cleanly.
+    for key in stats:
+        stats[key] = [] if key == "failed_urls" else 0
+
     started_at = now_utc()
     start_time = time.monotonic()
 
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        book_urls = discover_books()
-        records = scrape_books(book_urls)
+        book_sources = discover_books()
+        records = scrape_books(book_sources)
 
         RAW_FILE.write_text(
             json.dumps(records, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
-        print("\nBook URLs discovered:", len(book_urls))
+        print("\nBook URLs discovered:", len(book_sources))
         print("Raw records saved:", len(records))
 
     finally:
-        # Ensure a report is written even if an unexpected error occurs.
         write_report(start_time, started_at)
 
 
